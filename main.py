@@ -12,7 +12,7 @@ import os
 from datetime import date
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,8 +22,8 @@ load_dotenv()
 # ─────────────────────────────────────────
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-3.1-flash-lite")
+client = genai.Client(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 BASE_URL = "https://finance.yahoo.com/topic/stock-market-news"
 PAGES = [1, 2, 3]
@@ -82,14 +82,11 @@ async def fetch_article_list(page, page_num: int) -> list[dict]:
     else:
         url = f"{BASE_URL}/{page_num}/"
 
-    await page.goto(url, wait_until="networkidle", timeout=30000)
-
-    # page=2 이상에서 컨텐츠 로딩이 늦는 경우 추가 대기
-    if page_num >= 2:
-        try:
-            await page.wait_for_selector("h3 a, h2 a", timeout=10000)
-        except Exception:
-            pass  # 타임아웃 시 현재 상태로 진행
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await page.wait_for_selector("h3 a, h2 a", timeout=15000)
+    except Exception:
+        pass  # 타임아웃 시 현재 상태로 진행
 
     html = await page.content()
     soup = BeautifulSoup(html, "html.parser")
@@ -152,7 +149,7 @@ def passes_event_filter(title: str, body: str) -> tuple[bool, str]:
 async def fetch_article_body(page, url: str) -> str:
     """본문 텍스트 + 본문 내 티커 반환"""
     try:
-        await page.goto(url, wait_until="networkidle", timeout=20000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
         html = await page.content()
     except Exception:
         return ""
@@ -199,7 +196,7 @@ SUMMARY_PROMPT = """
 
 async def summarize_article(url: str, body: str) -> str:
     prompt = SUMMARY_PROMPT.format(url=url, body=body)
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     return response.text
 
 
@@ -222,7 +219,7 @@ RANKING_PROMPT = """
 async def rank_summaries(summaries: list[str]) -> str:
     combined = "\n\n---\n\n".join(summaries)
     prompt = RANKING_PROMPT.format(summaries=combined)
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
     return response.text
 
 
@@ -236,9 +233,17 @@ async def main():
     summaries = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        list_page = await browser.new_page()
-        article_page = await browser.new_page()
+        browser = await p.chromium.launch(
+            channel="chrome",
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
+        list_page = await context.new_page()
+        article_page = await context.new_page()
 
         # ── 기사 목록 수집 (page 1~3) ──
         for page_num in PAGES:
@@ -276,6 +281,7 @@ async def main():
             summary = await summarize_article(url, body)
             summaries.append(summary)
 
+        await context.close()
         await browser.close()
 
     print(f"\n{'='*50}")
